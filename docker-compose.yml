@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  xui-exporter:
+    image: ghcr.io/methol/xui-exporter:latest
+    container_name: xui-exporter
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    environment:
+      # Replace with your actual subscription URLs
+      - XUI_EXPORTER_TARGETS=http://example.com/sub/sid1,http://example.com/sub/sid2

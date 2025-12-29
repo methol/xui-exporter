@@ -1,0 +1,25 @@
+# Git
+.git
+.gitignore
+.github
+
+# Documentation
+*.md
+design.md
+requirements.md
+QUICKSTART.md
+
+# Build artifacts
+xui-exporter
+*.test
+
+# IDE
+.idea
+.vscode
+*.swp
+
+# Docker
+docker-compose.yml
+
+# Configs (examples only, not needed in image)
+prometheus.yml
