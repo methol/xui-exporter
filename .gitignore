@@ -1,5 +1,5 @@
 # Binaries
-xui-exporter
+/xui-exporter
 *.exe
 *.exe~
 *.dll

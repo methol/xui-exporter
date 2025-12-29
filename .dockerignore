@@ -10,7 +10,7 @@ requirements.md
 QUICKSTART.md
 
 # Build artifacts
-xui-exporter
+/xui-exporter
 *.test
 
 # IDE
