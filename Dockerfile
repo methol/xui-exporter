@@ -1,19 +1,22 @@
 # Build stage
 FROM golang:1.23-alpine AS builder
 
+# Install git and ca-certificates (required for go mod download)
+RUN apk --no-cache add git ca-certificates
+
 WORKDIR /app
 
 # Copy go mod files
 COPY go.mod go.sum ./
 
 # Download dependencies
-RUN go mod download
+RUN go mod download && go mod verify
 
 # Copy source code
 COPY . .
 
 # Build binary
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o xui-exporter ./cmd/xui-exporter
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags '-w -s' -o xui-exporter ./cmd/xui-exporter
 
 # Runtime stage
 FROM alpine:latest
