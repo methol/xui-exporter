@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -19,20 +21,36 @@ import (
 )
 
 const (
-	listenAddr       = ":9100"
-	metricsPath      = "/metrics"
-	refreshInterval  = 60 * time.Second
-	fetchConcurrency = 4
+	listenAddr        = ":9100"
+	metricsPath       = "/metrics"
+	refreshInterval   = 60 * time.Second
+	fetchConcurrency  = 4
+	defaultConfigPath = "/etc/xui-exporter/config.json"
 )
 
 func main() {
-	// Parse targets from environment variable
-	targets, err := config.ParseTargetsFromEnv()
+	// 解析命令行参数
+	configPath := flag.String("config", "", "Path to config file (default: /etc/xui-exporter/config.json)")
+	flag.Parse()
+
+	// 确定配置文件路径
+	cfgPath := *configPath
+	if cfgPath == "" {
+		cfgPath = defaultConfigPath
+	}
+
+	// 检查配置文件是否存在
+	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+		log.Fatalf("Config file not found: %s", cfgPath)
+	}
+
+	// 加载配置
+	cfg, err := config.LoadConfig(cfgPath)
 	if err != nil {
 		log.Fatalf("Configuration error: %v", err)
 	}
 
-	log.Printf("Loaded %d target(s) from XUI_EXPORTER_TARGETS", len(targets))
+	log.Printf("Loaded %d target(s) from %s", len(cfg.Targets), cfgPath)
 
 	// Initialize store
 	st := store.New()
@@ -45,10 +63,10 @@ func main() {
 
 	// Perform initial refresh before starting server
 	log.Printf("Performing initial refresh...")
-	refresh(targets, st)
+	refresh(cfg.Targets, st)
 
 	// Start refresh loop in background
-	go refreshLoop(targets, st, refreshInterval)
+	go refreshLoop(cfg.Targets, st, refreshInterval)
 
 	// Start HTTP server
 	http.Handle(metricsPath, promhttp.Handler())
@@ -72,7 +90,7 @@ func main() {
 }
 
 // refreshLoop runs the refresh process on a ticker
-func refreshLoop(targets []string, st *store.Store, interval time.Duration) {
+func refreshLoop(targets []config.Target, st *store.Store, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -82,7 +100,7 @@ func refreshLoop(targets []string, st *store.Store, interval time.Duration) {
 }
 
 // refresh fetches all targets concurrently and updates the store
-func refresh(targets []string, st *store.Store) {
+func refresh(targets []config.Target, st *store.Store) {
 	refreshStart := time.Now()
 	log.Printf("Starting refresh cycle for %d target(s)", len(targets))
 
@@ -96,14 +114,14 @@ func refresh(targets []string, st *store.Store) {
 
 	for _, target := range targets {
 		wg.Add(1)
-		go func(url string) {
+		go func(t config.Target) {
 			defer wg.Done()
 
 			// Acquire semaphore
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			fetchAndProcess(url, refreshStart, &newSnapshot, &mu)
+			fetchAndProcess(t, refreshStart, &newSnapshot, &mu)
 		}(target)
 	}
 
@@ -118,36 +136,36 @@ func refresh(targets []string, st *store.Store) {
 }
 
 // fetchAndProcess fetches a single target, parses it, and adds to snapshot
-func fetchAndProcess(url string, refreshStart time.Time, snapshot *map[string]compute.SubscriptionMetrics, mu *sync.Mutex) {
+func fetchAndProcess(target config.Target, refreshStart time.Time, snapshot *map[string]compute.SubscriptionMetrics, mu *sync.Mutex) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// Fetch HTML
-	htmlBytes, err := fetch.GetHTML(ctx, url)
-	if err != nil {
-		log.Printf("Failed to fetch %s: %v", url, err)
+	var parsed parse.ParsedSubscription
+	var err error
+
+	switch target.Type {
+	case "xui":
+		parsed, err = fetchXUI(ctx, target)
+	case "flux":
+		parsed, err = fetchFlux(ctx, target)
+	default:
+		log.Printf("Unknown target type '%s' for %s", target.Type, target.Name)
 		return
 	}
 
-	// Parse subscription data
-	parsed, err := parse.ParseSubscription(htmlBytes)
 	if err != nil {
-		// Log error with HTML preview for debugging
-		preview := string(htmlBytes)
-		if len(preview) > 500 {
-			preview = preview[:500] + "..."
-		}
-		log.Printf("Failed to parse %s: %v\nHTML preview (first 500 chars): %s", url, err, preview)
+		log.Printf("Failed to fetch %s (%s): %v", target.Name, target.Type, err)
+		mu.Lock()
+		(*snapshot)[target.Name] = compute.NewFailedMetrics(target.Name, refreshStart)
+		mu.Unlock()
 		return
 	}
-
-	sid := parsed.SID
 
 	// Validate quota (quota=0 is treated as failure)
 	if parsed.TotalByte == 0 {
-		log.Printf("Validation failed for %s (sid=%s): quota is 0 (not allowed)", url, sid)
+		log.Printf("Validation failed for %s: quota is 0 (not allowed)", target.Name)
 		mu.Lock()
-		(*snapshot)[sid] = compute.NewFailedMetrics(sid, refreshStart)
+		(*snapshot)[target.Name] = compute.NewFailedMetrics(target.Name, refreshStart)
 		mu.Unlock()
 		return
 	}
@@ -156,15 +174,37 @@ func fetchAndProcess(url string, refreshStart time.Time, snapshot *map[string]co
 	now := time.Now()
 	metricsData := compute.Compute(now, parsed, refreshStart)
 
-	// Add to snapshot (last write wins on sid collision)
+	// Add to snapshot
 	mu.Lock()
-	if existing, exists := (*snapshot)[sid]; exists {
-		log.Printf("Warning: SID %s appears in multiple targets, last write wins (previous from %s)", sid, url)
-		// Check if we're overwriting - just for logging
-		_ = existing
-	}
-	(*snapshot)[sid] = metricsData
+	(*snapshot)[target.Name] = metricsData
 	mu.Unlock()
 
-	log.Printf("Successfully processed %s (sid=%s)", url, sid)
+	log.Printf("Successfully processed %s (%s)", target.Name, target.Type)
+}
+
+// fetchXUI fetches and parses xui subscription HTML
+func fetchXUI(ctx context.Context, target config.Target) (parse.ParsedSubscription, error) {
+	htmlBytes, err := fetch.GetHTML(ctx, target.URL)
+	if err != nil {
+		return parse.ParsedSubscription{}, err
+	}
+
+	parsed, err := parse.ParseSubscription(htmlBytes)
+	if err != nil {
+		return parse.ParsedSubscription{}, err
+	}
+
+	// 使用配置文件中的 name 覆盖 SID
+	parsed.SID = target.Name
+	return parsed, nil
+}
+
+// fetchFlux fetches and parses flux-panel API response
+func fetchFlux(ctx context.Context, target config.Target) (parse.ParsedSubscription, error) {
+	jsonBytes, err := fetch.GetFluxAPI(ctx, target.URL, target.Token)
+	if err != nil {
+		return parse.ParsedSubscription{}, err
+	}
+
+	return parse.ParseFluxResponse(jsonBytes, target.Name, time.Now())
 }
