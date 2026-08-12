@@ -15,6 +15,10 @@
 # Go workspace file
 go.work
 
+# Local configuration and credentials
+/config.json
+/secrets/
+
 # IDE
 .idea/
 .vscode/

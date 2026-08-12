@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   xui-exporter:
     image: ghcr.io/methol/xui-exporter:latest
@@ -7,6 +5,17 @@ services:
     restart: unless-stopped
     ports:
       - "9100:9100"
-    environment:
-      # Replace with your actual subscription URLs
-      - XUI_EXPORTER_TARGETS=http://example.com/sub/sid1,http://example.com/sub/sid2
+    command:
+      - -config
+      - /etc/xui-exporter/config.json
+    volumes:
+      - ./config.json:/etc/xui-exporter/config.json:ro
+      - ./secrets/vnstat_ed25519:/run/secrets/vnstat_ed25519:ro
+      - ./secrets/known_hosts:/etc/xui-exporter/known_hosts:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

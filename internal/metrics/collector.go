@@ -11,21 +11,24 @@ type Collector struct {
 	store *store.Store
 
 	// Metric descriptors
-	up                         *prometheus.Desc
-	downloadBytes              *prometheus.Desc
-	uploadBytes                *prometheus.Desc
-	quotaBytes                 *prometheus.Desc
-	expireTimestampSeconds     *prometheus.Desc
-	usedBytes                  *prometheus.Desc
-	remainingBytes             *prometheus.Desc
-	usedRatio                  *prometheus.Desc
-	remainingRatio             *prometheus.Desc
-	secondsUntilExpire         *prometheus.Desc
-	daysUntilExpire            *prometheus.Desc
-	expired                    *prometheus.Desc
-	dailyBudgetBytes           *prometheus.Desc
-	lastRefreshTimestampSeconds *prometheus.Desc
-	refreshDurationSeconds     *prometheus.Desc
+	up                            *prometheus.Desc
+	downloadBytes                 *prometheus.Desc
+	uploadBytes                   *prometheus.Desc
+	quotaBytes                    *prometheus.Desc
+	expireTimestampSeconds        *prometheus.Desc
+	usedBytes                     *prometheus.Desc
+	remainingBytes                *prometheus.Desc
+	usedRatio                     *prometheus.Desc
+	remainingRatio                *prometheus.Desc
+	secondsUntilExpire            *prometheus.Desc
+	daysUntilExpire               *prometheus.Desc
+	expired                       *prometheus.Desc
+	dailyBudgetBytes              *prometheus.Desc
+	lastRefreshTimestampSeconds   *prometheus.Desc
+	lastSuccessTimestampSeconds   *prometheus.Desc
+	sourceUpdatedTimestampSeconds *prometheus.Desc
+	sourceInfo                    *prometheus.Desc
+	refreshDurationSeconds        *prometheus.Desc
 }
 
 // NewCollector creates a new Collector
@@ -116,6 +119,24 @@ func NewCollector(s *store.Store) *Collector {
 			[]string{"sid"},
 			nil,
 		),
+		lastSuccessTimestampSeconds: prometheus.NewDesc(
+			"xui_subscription_last_success_timestamp_seconds",
+			"Timestamp of the last successful refresh",
+			[]string{"sid"},
+			nil,
+		),
+		sourceUpdatedTimestampSeconds: prometheus.NewDesc(
+			"xui_subscription_source_updated_timestamp_seconds",
+			"Timestamp when the source data was last updated",
+			[]string{"sid"},
+			nil,
+		),
+		sourceInfo: prometheus.NewDesc(
+			"xui_subscription_source_info",
+			"Subscription source information",
+			[]string{"sid", "source"},
+			nil,
+		),
 		refreshDurationSeconds: prometheus.NewDesc(
 			"xui_subscription_refresh_duration_seconds",
 			"Duration of the last refresh attempt in seconds",
@@ -141,6 +162,9 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.expired
 	ch <- c.dailyBudgetBytes
 	ch <- c.lastRefreshTimestampSeconds
+	ch <- c.lastSuccessTimestampSeconds
+	ch <- c.sourceUpdatedTimestampSeconds
+	ch <- c.sourceInfo
 	ch <- c.refreshDurationSeconds
 }
 
@@ -159,27 +183,46 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			labels...,
 		)
 
-		// Always export troubleshooting metrics (if available)
-		if metrics.LastRefreshTimestampSeconds > 0 {
-			ch <- prometheus.MustNewConstMetric(
-				c.lastRefreshTimestampSeconds,
-				prometheus.GaugeValue,
-				metrics.LastRefreshTimestampSeconds,
-				labels...,
-			)
-		}
+		// Always export refresh and source metadata, including zero values before
+		// the first successful refresh.
+		ch <- prometheus.MustNewConstMetric(
+			c.lastRefreshTimestampSeconds,
+			prometheus.GaugeValue,
+			metrics.LastRefreshTimestampSeconds,
+			labels...,
+		)
 
-		if metrics.RefreshDurationSeconds > 0 {
-			ch <- prometheus.MustNewConstMetric(
-				c.refreshDurationSeconds,
-				prometheus.GaugeValue,
-				metrics.RefreshDurationSeconds,
-				labels...,
-			)
-		}
+		ch <- prometheus.MustNewConstMetric(
+			c.refreshDurationSeconds,
+			prometheus.GaugeValue,
+			metrics.RefreshDurationSeconds,
+			labels...,
+		)
 
-		// Only export other metrics if the subscription is up
-		if !metrics.Up {
+		ch <- prometheus.MustNewConstMetric(
+			c.lastSuccessTimestampSeconds,
+			prometheus.GaugeValue,
+			metrics.LastSuccessTimestampSeconds,
+			labels...,
+		)
+
+		ch <- prometheus.MustNewConstMetric(
+			c.sourceUpdatedTimestampSeconds,
+			prometheus.GaugeValue,
+			metrics.SourceUpdatedTimestampSeconds,
+			labels...,
+		)
+
+		ch <- prometheus.MustNewConstMetric(
+			c.sourceInfo,
+			prometheus.GaugeValue,
+			1,
+			sid,
+			metrics.Source,
+		)
+
+		// Export data whenever a valid current or cached value exists.
+		if !metrics.HasData {
 			continue
 		}
 

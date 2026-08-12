@@ -1,0 +1,35 @@
+{
+  "refresh_interval_seconds": 300,
+  "targets": [
+    {
+      "name": "my-xui-sub1",
+      "type": "xui",
+      "url": "https://example.com/sub/sid1"
+    },
+    {
+      "name": "my-flux-panel",
+      "type": "flux",
+      "url": "https://example.com/api/v1/user/package",
+      "token": "replace-with-your-jwt-token"
+    },
+    {
+      "name": "my-vnstat-server",
+      "type": "vnstat_ssh",
+      "vnstat_ssh": {
+        "host": "203.0.113.10",
+        "port": 22,
+        "username": "vnstat-exporter",
+        "private_key_file": "/run/secrets/vnstat_ed25519",
+        "known_hosts_file": "/etc/xui-exporter/known_hosts",
+        "interface": "ens3",
+        "quota_bytes": 536870912000,
+        "billing_cycle_day": 17,
+        "timezone": "UTC",
+        "lookback_days": 62,
+        "connect_timeout_seconds": 10,
+        "command_timeout_seconds": 15,
+        "max_data_age_seconds": 900
+      }
+    }
+  ]
+}

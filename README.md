@@ -2,129 +2,225 @@
 
 [![Build and Push Docker Image](https://github.com/methol/xui-exporter/actions/workflows/docker-build.yml/badge.svg)](https://github.com/methol/xui-exporter/actions/workflows/docker-build.yml)
 
-A Prometheus Exporter for monitoring x-ui / 3x-ui subscription traffic usage and flux-panel traffic data.
+A cached Prometheus exporter for x-ui / 3x-ui subscriptions, flux-panel, and
+vnStat daily traffic collected over restricted SSH.
 
 ## Features
 
-- Support for x-ui / 3x-ui subscription page scraping
-- Support for flux-panel API data collection
-- Multiple targets in a single exporter instance
-- JSON configuration file for easy management
+- Existing `xui` and `flux` target formats remain compatible.
+- `vnstat_ssh` uses one private key and mandatory OpenSSH `known_hosts`
+  verification. Passwords, ssh-agent, keyboard-interactive authentication,
+  arbitrary commands, and the system `ssh` binary are not supported.
+- vnStat 2.x daily `rx` and `tx` are aggregated into a configurable monthly
+  billing cycle and exposed through the existing `xui_subscription_*` metrics.
+- A failed refresh sets `up=0` while retaining the last valid traffic values.
+- Multiple targets refresh concurrently; Prometheus scrapes only the in-memory
+  snapshot.
 
 ## Configuration
 
-Create a JSON configuration file (e.g., `config.json`):
+Copy [`config.example.json`](config.example.json) to `config.json` and edit it.
+The default config path is `/etc/xui-exporter/config.json`; override it with
+`-config`.
 
 ```json
 {
+  "refresh_interval_seconds": 300,
   "targets": [
     {
       "name": "my-xui-sub1",
       "type": "xui",
-      "url": "http://example.com/sub/sid1"
-    },
-    {
-      "name": "my-xui-sub2",
-      "type": "xui",
-      "url": "http://example.com/sub/sid2"
+      "url": "https://example.com/sub/sid1"
     },
     {
       "name": "my-flux-panel",
       "type": "flux",
       "url": "https://example.com/api/v1/user/package",
-      "token": "your-jwt-token-here"
+      "token": "replace-with-your-jwt-token"
+    },
+    {
+      "name": "my-vnstat-server",
+      "type": "vnstat_ssh",
+      "vnstat_ssh": {
+        "host": "203.0.113.10",
+        "port": 22,
+        "username": "vnstat-exporter",
+        "private_key_file": "/run/secrets/vnstat_ed25519",
+        "known_hosts_file": "/etc/xui-exporter/known_hosts",
+        "interface": "ens3",
+        "quota_bytes": 536870912000,
+        "billing_cycle_day": 17,
+        "timezone": "UTC",
+        "lookback_days": 62,
+        "connect_timeout_seconds": 10,
+        "command_timeout_seconds": 15,
+        "max_data_age_seconds": 900
+      }
     }
   ]
 }
 ```
 
-### Target Fields
+Before production, manually confirm both `billing_cycle_day` and
+`quota_bytes`. The exporter deliberately does not infer whether a provider's
+“500 GB” means 500,000,000,000 bytes or 536,870,912,000 bytes.
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | Yes | Unique identifier, used as `sid` label in Prometheus metrics |
-| `type` | Yes | Target type: `xui` or `flux` |
-| `url` | Yes | Target URL |
-| `token` | Only for `flux` | Authorization header value (JWT token) |
+`vnstat_ssh` defaults are: port `22`, lookback `62` days, connect timeout `10s`,
+command timeout `15s`, and maximum data age `900s`. The lookback must be between
+35 and 400 days. Both key paths must be absolute, readable files. The interface
+is restricted to `[A-Za-z0-9_.:+-]`, and the timezone must be a valid IANA name.
 
-## Usage
+## Remote vnStat setup
 
-### Docker (Recommended)
-
-```bash
-docker run -d \
-  --name xui-exporter \
-  -p 9100:9100 \
-  -v /path/to/config.json:/etc/xui-exporter/config.json \
-  ghcr.io/methol/xui-exporter:latest
-```
-
-Or with a custom config path:
+First verify the interface name and vnStat access on the VPS:
 
 ```bash
-docker run -d \
-  --name xui-exporter \
-  -p 9100:9100 \
-  -v /path/to/config.json:/app/config.json \
-  ghcr.io/methol/xui-exporter:latest \
-  -config /app/config.json
+vnstat --version
+vnstat --dbiflist 1
+vnstat --iface ens3 --json d 2
+systemctl is-active vnstat
 ```
 
-### Binary
+Create an unprivileged account and verify that it can read vnStat without
+`sudo`:
 
 ```bash
-# Default config path: /etc/xui-exporter/config.json
-./xui-exporter
-
-# Custom config path
-./xui-exporter -config /path/to/config.json
+sudo adduser --disabled-password --gecos "" --shell /bin/sh vnstat-exporter
+sudo -u vnstat-exporter /usr/bin/vnstat --iface ens3 --json d 2
 ```
 
-## Prometheus Configuration
+Install a fixed command wrapper. Adjust `ens3` once here if the VPS uses a
+different interface:
 
-Add to `prometheus.yml`:
-
-```yaml
-scrape_configs:
-  - job_name: 'xui-exporter'
-    static_configs:
-      - targets: ['localhost:9100']
-    scrape_interval: 60s
+```bash
+sudo install -d -m 0755 /usr/local/libexec
+sudo tee /usr/local/libexec/xui-exporter-vnstat >/dev/null <<'EOF'
+#!/bin/sh
+set -eu
+export LC_ALL=C
+exec /usr/bin/vnstat --iface ens3 --json d 62
+EOF
+sudo chown root:root /usr/local/libexec/xui-exporter-vnstat
+sudo chmod 0755 /usr/local/libexec/xui-exporter-vnstat
 ```
 
-## Grafana Dashboard
+Create a dedicated key on the exporter host:
 
-Import `grafana-dashboard.json` from this repository:
+```bash
+mkdir -p ./secrets
+chmod 700 ./secrets
+ssh-keygen -t ed25519 -f ./secrets/vnstat_ed25519 -N '' \
+  -C 'xui-exporter vnstat readonly'
+```
 
-1. Open Grafana -> Dashboards -> Import
-2. Upload `grafana-dashboard.json` or paste its content
-3. Select your Prometheus data source
-4. Click Import
+Put the public key in
+`/home/vnstat-exporter/.ssh/authorized_keys` on the VPS using this restriction:
+
+```text
+restrict,command="/usr/local/libexec/xui-exporter-vnstat" ssh-ed25519 AAAA... xui-exporter-vnstat-readonly
+```
+
+Optionally prepend `from="EXPORTER_IP/32",`. Then set ownership and modes:
+
+```bash
+sudo chown -R vnstat-exporter:vnstat-exporter /home/vnstat-exporter/.ssh
+sudo chmod 700 /home/vnstat-exporter/.ssh
+sudo chmod 600 /home/vnstat-exporter/.ssh/authorized_keys
+```
+
+Create `known_hosts` and verify the host-key fingerprint through a trusted
+channel or a first manual SSH login. `ssh-keyscan` output alone is not proof of
+server identity.
+
+```bash
+ssh-keyscan -H -p 22 203.0.113.10 > ./secrets/known_hosts
+chmod 600 ./secrets/known_hosts
+ssh -i ./secrets/vnstat_ed25519 \
+  -o IdentitiesOnly=yes \
+  -o UserKnownHostsFile=./secrets/known_hosts \
+  vnstat-exporter@203.0.113.10 ignored | jq .
+```
+
+The remote key must return JSON and must not provide an interactive shell. Keep
+`vnstat` enabled under systemd; the exporter cannot reconstruct traffic missed
+while `vnstatd` was stopped.
+
+## Run
+
+With Docker Compose:
+
+```bash
+cp config.example.json config.json
+docker compose up -d
+```
+
+Or run the binary:
+
+```bash
+go build -o xui-exporter ./cmd/xui-exporter
+./xui-exporter -config ./config.json
+```
+
+The exporter listens on `:9100` and exposes `/metrics`.
 
 ## Metrics
 
-All metrics have label `sid` (subscription ID from config `name` field).
+Existing metrics retain their names and `sid`-only labels:
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `xui_subscription_up` | Gauge | 1 if target is reachable, 0 otherwise |
-| `xui_subscription_used_bytes` | Gauge | Total bytes used (upload + download) |
-| `xui_subscription_remaining_bytes` | Gauge | Remaining bytes in quota |
-| `xui_subscription_quota_bytes` | Gauge | Total quota in bytes |
-| `xui_subscription_used_ratio` | Gauge | Usage ratio (0.0 - 1.0) |
-| `xui_subscription_days_until_expire` | Gauge | Days until subscription expires/resets |
-| `xui_subscription_expired` | Gauge | 1 if expired, 0 otherwise |
-| `xui_subscription_daily_budget_bytes` | Gauge | Recommended daily usage to stay within quota |
+- `xui_subscription_up`
+- `xui_subscription_download_bytes`
+- `xui_subscription_upload_bytes`
+- `xui_subscription_used_bytes`
+- `xui_subscription_quota_bytes`
+- `xui_subscription_remaining_bytes`
+- `xui_subscription_used_ratio`
+- `xui_subscription_remaining_ratio`
+- `xui_subscription_expire_timestamp_seconds`
+- `xui_subscription_seconds_until_expire`
+- `xui_subscription_days_until_expire`
+- `xui_subscription_expired`
+- `xui_subscription_daily_budget_bytes`
+- `xui_subscription_last_refresh_timestamp_seconds`
+- `xui_subscription_refresh_duration_seconds`
+
+New freshness metadata:
+
+- `xui_subscription_last_success_timestamp_seconds{sid}`
+- `xui_subscription_source_updated_timestamp_seconds{sid}`
+- `xui_subscription_source_info{sid,source} 1`
+
+When a refresh fails, `up` becomes `0`. Traffic metrics remain present only if
+a previous successful value exists. For vnStat, stale data, future timestamps,
+an incomplete current cycle, or a same-cycle usage decrease are rejected.
+
+Example alerts:
+
+```promql
+xui_subscription_up{sid="my-vnstat-server"} == 0
+time() - xui_subscription_last_success_timestamp_seconds{sid="my-vnstat-server"} > 900
+time() - xui_subscription_source_updated_timestamp_seconds{sid="my-vnstat-server"} > 900
+xui_subscription_used_ratio{sid="my-vnstat-server"} > 0.80
+```
 
 ## Development
 
 ```bash
-# Build
-go build -o xui-exporter ./cmd/xui-exporter
-
-# Run tests
+gofmt -w .
 go test ./...
-
-# Docker build
-docker build -t xui-exporter .
+go test -race ./...
+go vet ./...
+go build ./cmd/xui-exporter
+docker build -t xui-exporter:vnstat-ssh .
 ```
+
+Tests use an in-process SSH server and do not connect to a public host.
+
+## Known limitations
+
+- Daily records only support billing boundaries at local midnight.
+- vnStat measures traffic inside the guest, which may differ from provider
+  billing because of accounting layer, timezone, or provider-specific rules.
+- A rebuilt vnStat database makes the current cycle incomplete; the exporter
+  fails closed instead of publishing a lower value.
+- Current freshness detects a database that has stopped updating, but not a
+  historical gap after `vnstatd` later recovers.

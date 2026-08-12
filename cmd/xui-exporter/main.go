@@ -23,7 +23,6 @@ import (
 const (
 	listenAddr        = ":9100"
 	metricsPath       = "/metrics"
-	refreshInterval   = 60 * time.Second
 	fetchConcurrency  = 4
 	defaultConfigPath = "/etc/xui-exporter/config.json"
 )
@@ -66,6 +65,7 @@ func main() {
 	refresh(cfg.Targets, st)
 
 	// Start refresh loop in background
+	refreshInterval := time.Duration(cfg.RefreshIntervalSeconds) * time.Second
 	go refreshLoop(cfg.Targets, st, refreshInterval)
 
 	// Start HTTP server
@@ -104,6 +104,9 @@ func refresh(targets []config.Target, st *store.Store) {
 	refreshStart := time.Now()
 	log.Printf("Starting refresh cycle for %d target(s)", len(targets))
 
+	// Read the previous snapshot once so failed targets can retain valid data.
+	previousSnapshot := st.GetSnapshot()
+
 	// Create new snapshot map
 	newSnapshot := make(map[string]compute.SubscriptionMetrics)
 	var mu sync.Mutex
@@ -121,7 +124,7 @@ func refresh(targets []config.Target, st *store.Store) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			fetchAndProcess(t, refreshStart, &newSnapshot, &mu)
+			fetchAndProcess(t, previousSnapshot, refreshStart, &newSnapshot, &mu)
 		}(target)
 	}
 
@@ -136,11 +139,18 @@ func refresh(targets []config.Target, st *store.Store) {
 }
 
 // fetchAndProcess fetches a single target, parses it, and adds to snapshot
-func fetchAndProcess(target config.Target, refreshStart time.Time, snapshot *map[string]compute.SubscriptionMetrics, mu *sync.Mutex) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+func fetchAndProcess(
+	target config.Target,
+	previousSnapshot map[string]compute.SubscriptionMetrics,
+	refreshStart time.Time,
+	snapshot *map[string]compute.SubscriptionMetrics,
+	mu *sync.Mutex,
+) {
+	ctx, cancel := context.WithTimeout(context.Background(), targetOperationTimeout(target))
 	defer cancel()
 
 	var parsed parse.ParsedSubscription
+	metadata := compute.SourceMetadata{SourceType: target.Type}
 	var err error
 
 	switch target.Type {
@@ -148,31 +158,39 @@ func fetchAndProcess(target config.Target, refreshStart time.Time, snapshot *map
 		parsed, err = fetchXUI(ctx, target)
 	case "flux":
 		parsed, err = fetchFlux(ctx, target)
+	case "vnstat_ssh":
+		parsed, metadata.SourceUpdatedAt, err = fetchVNStatSSH(ctx, target, time.Now())
 	default:
-		log.Printf("Unknown target type '%s' for %s", target.Type, target.Name)
-		return
+		err = fmt.Errorf("unknown target type %q", target.Type)
+	}
+	if err == nil && metadata.SourceUpdatedAt.IsZero() {
+		// HTTP sources do not expose an upstream update timestamp, so use the
+		// time the response was successfully received.
+		metadata.SourceUpdatedAt = time.Now()
 	}
 
 	if err != nil {
+		storeFailedTarget(target, previousSnapshot, refreshStart, snapshot, mu)
 		log.Printf("Failed to fetch %s (%s): %v", target.Name, target.Type, err)
-		mu.Lock()
-		(*snapshot)[target.Name] = compute.NewFailedMetrics(target.Name, refreshStart)
-		mu.Unlock()
 		return
 	}
 
 	// Validate quota (quota=0 is treated as failure)
 	if parsed.TotalByte == 0 {
+		storeFailedTarget(target, previousSnapshot, refreshStart, snapshot, mu)
 		log.Printf("Validation failed for %s: quota is 0 (not allowed)", target.Name)
-		mu.Lock()
-		(*snapshot)[target.Name] = compute.NewFailedMetrics(target.Name, refreshStart)
-		mu.Unlock()
 		return
 	}
 
 	// Compute metrics
 	now := time.Now()
-	metricsData := compute.Compute(now, parsed, refreshStart)
+	metricsData := compute.ComputeWithMetadata(now, parsed, refreshStart, metadata)
+	previous, hasPrevious := previousSnapshot[target.Name]
+	if err := validateUsageMonotonic(target, metricsData, previous, hasPrevious); err != nil {
+		storeFailedTarget(target, previousSnapshot, refreshStart, snapshot, mu)
+		log.Printf("Validation failed for %s (%s): %v", target.Name, target.Type, err)
+		return
+	}
 
 	// Add to snapshot
 	mu.Lock()
@@ -180,6 +198,55 @@ func fetchAndProcess(target config.Target, refreshStart time.Time, snapshot *map
 	mu.Unlock()
 
 	log.Printf("Successfully processed %s (%s)", target.Name, target.Type)
+}
+
+func targetOperationTimeout(target config.Target) time.Duration {
+	if target.Type == "vnstat_ssh" && target.VNStatSSH != nil {
+		connectTimeout := time.Duration(target.VNStatSSH.ConnectTimeoutSeconds) * time.Second
+		commandTimeout := time.Duration(target.VNStatSSH.CommandTimeoutSeconds) * time.Second
+		return connectTimeout + commandTimeout + time.Second
+	}
+	return 15 * time.Second
+}
+
+func storeFailedTarget(
+	target config.Target,
+	previousSnapshot map[string]compute.SubscriptionMetrics,
+	refreshStart time.Time,
+	snapshot *map[string]compute.SubscriptionMetrics,
+	mu *sync.Mutex,
+) {
+	var previous *compute.SubscriptionMetrics
+	if value, ok := previousSnapshot[target.Name]; ok {
+		previous = &value
+	}
+	failed := compute.MarkFailed(target.Name, target.Type, previous, refreshStart)
+
+	mu.Lock()
+	(*snapshot)[target.Name] = failed
+	mu.Unlock()
+}
+
+func validateUsageMonotonic(
+	target config.Target,
+	current compute.SubscriptionMetrics,
+	previous compute.SubscriptionMetrics,
+	hasPrevious bool,
+) error {
+	if target.Type != "vnstat_ssh" || !hasPrevious || !previous.HasData {
+		return nil
+	}
+	if current.ExpireTimestampSeconds != previous.ExpireTimestampSeconds {
+		return nil
+	}
+	if current.UsedBytes < previous.UsedBytes {
+		return fmt.Errorf(
+			"same-cycle usage decreased from %d to %d bytes; possible vnStat database rebuild, rollback, or corruption",
+			previous.UsedBytes,
+			current.UsedBytes,
+		)
+	}
+	return nil
 }
 
 // fetchXUI fetches and parses xui subscription HTML
@@ -207,4 +274,57 @@ func fetchFlux(ctx context.Context, target config.Target) (parse.ParsedSubscript
 	}
 
 	return parse.ParseFluxResponse(jsonBytes, target.Name, time.Now())
+}
+
+// fetchVNStatSSH queries one fixed, read-only vnStat command over SSH and
+// converts its daily data into the existing ParsedSubscription model.
+func fetchVNStatSSH(
+	ctx context.Context,
+	target config.Target,
+	now time.Time,
+) (parse.ParsedSubscription, time.Time, error) {
+	cfg := target.VNStatSSH
+	if cfg == nil {
+		return parse.ParsedSubscription{}, time.Time{}, fmt.Errorf("vnstat_ssh configuration is missing")
+	}
+
+	location, err := time.LoadLocation(cfg.Timezone)
+	if err != nil {
+		return parse.ParsedSubscription{}, time.Time{}, fmt.Errorf("load vnStat timezone: %w", err)
+	}
+	command := buildVNStatCommand(cfg)
+	stdout, _, err := fetch.RunSSHCommand(ctx, fetch.SSHCommandConfig{
+		Host:           cfg.Host,
+		Port:           cfg.Port,
+		Username:       cfg.Username,
+		PrivateKeyFile: cfg.PrivateKeyFile,
+		KnownHostsFile: cfg.KnownHostsFile,
+		ConnectTimeout: time.Duration(cfg.ConnectTimeoutSeconds) * time.Second,
+		CommandTimeout: time.Duration(cfg.CommandTimeoutSeconds) * time.Second,
+		MaxOutputBytes: fetch.DefaultSSHMaxOutputBytes,
+	}, command)
+	if err != nil {
+		return parse.ParsedSubscription{}, time.Time{}, err
+	}
+
+	parsed, updatedAt, err := parse.ParseVNStat(stdout, parse.VNStatParseConfig{
+		SID:             target.Name,
+		Interface:       cfg.Interface,
+		QuotaBytes:      cfg.QuotaBytes,
+		BillingCycleDay: cfg.BillingCycleDay,
+		Location:        location,
+		MaxDataAge:      time.Duration(cfg.MaxDataAgeSeconds) * time.Second,
+	}, now)
+	if err != nil {
+		return parse.ParsedSubscription{}, time.Time{}, err
+	}
+	return parsed, updatedAt, nil
+}
+
+func buildVNStatCommand(cfg *config.VNStatSSHConfig) string {
+	return fmt.Sprintf(
+		"LC_ALL=C /usr/bin/vnstat --iface %s --json d %d",
+		cfg.Interface,
+		cfg.LookbackDays,
+	)
 }

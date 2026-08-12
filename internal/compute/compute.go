@@ -9,35 +9,57 @@ import (
 // SubscriptionMetrics contains all computed metrics for a subscription
 type SubscriptionMetrics struct {
 	// Metadata
-	SID string
+	SID    string
+	Source string
 
 	// Health
-	Up bool
+	Up      bool
+	HasData bool
 
-	// Raw metrics (from x-ui)
-	DownloadBytes         int64
-	UploadBytes           int64
-	QuotaBytes            int64
+	// Raw metrics (from the source)
+	DownloadBytes          int64
+	UploadBytes            int64
+	QuotaBytes             int64
 	ExpireTimestampSeconds int64
 
 	// Derived metrics
-	UsedBytes                 int64
-	RemainingBytes            int64
-	UsedRatio                 float64
-	RemainingRatio            float64
-	SecondsUntilExpire        int64
-	DaysUntilExpire           float64
-	Expired                   int64 // 0 or 1
-	DailyBudgetBytes          float64
+	UsedBytes          int64
+	RemainingBytes     int64
+	UsedRatio          float64
+	RemainingRatio     float64
+	SecondsUntilExpire int64
+	DaysUntilExpire    float64
+	Expired            int64 // 0 or 1
+	DailyBudgetBytes   float64
 
 	// Troubleshooting metrics
-	LastRefreshTimestampSeconds float64
-	RefreshDurationSeconds      float64
+	LastRefreshTimestampSeconds   float64
+	LastSuccessTimestampSeconds   float64
+	SourceUpdatedTimestampSeconds float64
+	RefreshDurationSeconds        float64
+}
+
+// SourceMetadata describes the source of a successful refresh.
+type SourceMetadata struct {
+	SourceType      string
+	SourceUpdatedAt time.Time
 }
 
 // Compute calculates all derived metrics from parsed subscription data
 // now is the current time used for time-based calculations
 func Compute(now time.Time, parsed parse.ParsedSubscription, refreshStart time.Time) SubscriptionMetrics {
+	return ComputeWithMetadata(now, parsed, refreshStart, SourceMetadata{
+		SourceUpdatedAt: now,
+	})
+}
+
+// ComputeWithMetadata calculates all derived metrics and records source metadata.
+func ComputeWithMetadata(
+	now time.Time,
+	parsed parse.ParsedSubscription,
+	refreshStart time.Time,
+	metadata SourceMetadata,
+) SubscriptionMetrics {
 	nowUnix := now.Unix()
 
 	// Calculate used bytes
@@ -73,38 +95,62 @@ func Compute(now time.Time, parsed parse.ParsedSubscription, refreshStart time.T
 	// If expired or no remaining bytes, daily budget is 0
 
 	// Calculate troubleshooting metrics
-	refreshDuration := time.Since(refreshStart).Seconds()
+	refreshDuration := now.Sub(refreshStart).Seconds()
+	sourceUpdatedAt := metadata.SourceUpdatedAt
+	if sourceUpdatedAt.IsZero() {
+		sourceUpdatedAt = now
+	}
 
 	return SubscriptionMetrics{
-		SID:                    parsed.SID,
-		Up:                     true,
-		DownloadBytes:          parsed.DownloadByte,
-		UploadBytes:            parsed.UploadByte,
-		QuotaBytes:             parsed.TotalByte,
-		ExpireTimestampSeconds: parsed.Expire,
-		UsedBytes:              usedBytes,
-		RemainingBytes:         remainingBytes,
-		UsedRatio:              usedRatio,
-		RemainingRatio:         remainingRatio,
-		SecondsUntilExpire:     secondsUntilExpire,
-		DaysUntilExpire:        daysUntilExpire,
-		Expired:                expired,
-		DailyBudgetBytes:       dailyBudgetBytes,
-		LastRefreshTimestampSeconds: float64(now.Unix()),
-		RefreshDurationSeconds:      refreshDuration,
+		SID:                           parsed.SID,
+		Source:                        metadata.SourceType,
+		Up:                            true,
+		HasData:                       true,
+		DownloadBytes:                 parsed.DownloadByte,
+		UploadBytes:                   parsed.UploadByte,
+		QuotaBytes:                    parsed.TotalByte,
+		ExpireTimestampSeconds:        parsed.Expire,
+		UsedBytes:                     usedBytes,
+		RemainingBytes:                remainingBytes,
+		UsedRatio:                     usedRatio,
+		RemainingRatio:                remainingRatio,
+		SecondsUntilExpire:            secondsUntilExpire,
+		DaysUntilExpire:               daysUntilExpire,
+		Expired:                       expired,
+		DailyBudgetBytes:              dailyBudgetBytes,
+		LastRefreshTimestampSeconds:   float64(nowUnix),
+		LastSuccessTimestampSeconds:   float64(nowUnix),
+		SourceUpdatedTimestampSeconds: float64(sourceUpdatedAt.Unix()),
+		RefreshDurationSeconds:        refreshDuration,
 	}
 }
 
 // NewFailedMetrics creates a SubscriptionMetrics with up=0 for a failed subscription
 // This is used when we know the SID but parsing/validation failed
 func NewFailedMetrics(sid string, refreshStart time.Time) SubscriptionMetrics {
+	return MarkFailed(sid, "", nil, refreshStart)
+}
+
+// MarkFailed records a failed refresh while preserving the last valid data.
+func MarkFailed(
+	sid string,
+	source string,
+	previous *SubscriptionMetrics,
+	refreshStart time.Time,
+) SubscriptionMetrics {
 	now := time.Now()
 	refreshDuration := now.Sub(refreshStart).Seconds()
 
-	return SubscriptionMetrics{
-		SID:                         sid,
-		Up:                          false,
-		LastRefreshTimestampSeconds: float64(now.Unix()),
-		RefreshDurationSeconds:      refreshDuration,
+	var result SubscriptionMetrics
+	if previous != nil {
+		result = *previous
 	}
+
+	result.SID = sid
+	result.Source = source
+	result.Up = false
+	result.LastRefreshTimestampSeconds = float64(now.Unix())
+	result.RefreshDurationSeconds = refreshDuration
+
+	return result
 }

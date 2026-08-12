@@ -23,3 +23,5 @@ docker-compose.yml
 
 # Configs (examples only, not needed in image)
 prometheus.yml
+/config.json
+/secrets/

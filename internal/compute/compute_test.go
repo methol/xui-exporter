@@ -17,7 +17,7 @@ func TestCompute_Success(t *testing.T) {
 		DownloadByte: 100 * 1024 * 1024 * 1024, // 100 GB
 		UploadByte:   20 * 1024 * 1024 * 1024,  // 20 GB
 		TotalByte:    500 * 1024 * 1024 * 1024, // 500 GB
-		Expire:       now.Unix() + 30*86400,     // 30 days from now
+		Expire:       now.Unix() + 30*86400,    // 30 days from now
 	}
 
 	result := Compute(now, parsed, refreshStart)
@@ -29,6 +29,14 @@ func TestCompute_Success(t *testing.T) {
 
 	if !result.Up {
 		t.Errorf("Expected Up=true, got false")
+	}
+
+	if !result.HasData {
+		t.Errorf("Expected HasData=true, got false")
+	}
+
+	if result.LastSuccessTimestampSeconds != float64(now.Unix()) {
+		t.Errorf("Expected LastSuccessTimestampSeconds %d, got %f", now.Unix(), result.LastSuccessTimestampSeconds)
 	}
 
 	// Check used bytes (100 GB + 20 GB = 120 GB)
@@ -70,6 +78,41 @@ func TestCompute_Success(t *testing.T) {
 	expectedDailyBudget := float64(expectedRemaining) / 30.0
 	if result.DailyBudgetBytes != expectedDailyBudget {
 		t.Errorf("Expected DailyBudgetBytes %f, got %f", expectedDailyBudget, result.DailyBudgetBytes)
+	}
+}
+
+func TestComputeWithMetadata(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 5, 0, time.UTC)
+	refreshStart := now.Add(-5 * time.Second)
+	sourceUpdatedAt := now.Add(-2 * time.Minute)
+	parsed := parse.ParsedSubscription{
+		SID:       "metadata-test",
+		TotalByte: 1000,
+		Expire:    now.Add(24 * time.Hour).Unix(),
+	}
+
+	result := ComputeWithMetadata(now, parsed, refreshStart, SourceMetadata{
+		SourceType:      "vnstat_ssh",
+		SourceUpdatedAt: sourceUpdatedAt,
+	})
+
+	if result.Source != "vnstat_ssh" {
+		t.Errorf("Expected Source vnstat_ssh, got %q", result.Source)
+	}
+	if !result.Up || !result.HasData {
+		t.Errorf("Expected successful result with data, got Up=%t HasData=%t", result.Up, result.HasData)
+	}
+	if result.LastRefreshTimestampSeconds != float64(now.Unix()) {
+		t.Errorf("Expected LastRefreshTimestampSeconds %d, got %f", now.Unix(), result.LastRefreshTimestampSeconds)
+	}
+	if result.LastSuccessTimestampSeconds != float64(now.Unix()) {
+		t.Errorf("Expected LastSuccessTimestampSeconds %d, got %f", now.Unix(), result.LastSuccessTimestampSeconds)
+	}
+	if result.SourceUpdatedTimestampSeconds != float64(sourceUpdatedAt.Unix()) {
+		t.Errorf("Expected SourceUpdatedTimestampSeconds %d, got %f", sourceUpdatedAt.Unix(), result.SourceUpdatedTimestampSeconds)
+	}
+	if result.RefreshDurationSeconds != 5 {
+		t.Errorf("Expected RefreshDurationSeconds 5, got %f", result.RefreshDurationSeconds)
 	}
 }
 
@@ -168,11 +211,85 @@ func TestNewFailedMetrics(t *testing.T) {
 		t.Errorf("Expected Up=false, got true")
 	}
 
+	if result.HasData {
+		t.Errorf("Expected HasData=false, got true")
+	}
+
 	if result.LastRefreshTimestampSeconds <= 0 {
 		t.Errorf("Expected positive LastRefreshTimestampSeconds, got %f", result.LastRefreshTimestampSeconds)
 	}
 
 	if result.RefreshDurationSeconds <= 0 {
 		t.Errorf("Expected positive RefreshDurationSeconds, got %f", result.RefreshDurationSeconds)
+	}
+}
+
+func TestMarkFailedWithoutPreviousData(t *testing.T) {
+	refreshStart := time.Now().Add(-3 * time.Second)
+
+	result := MarkFailed("failed123", "vnstat_ssh", nil, refreshStart)
+
+	if result.SID != "failed123" || result.Source != "vnstat_ssh" {
+		t.Errorf("Expected failed123/vnstat_ssh identity, got %s/%s", result.SID, result.Source)
+	}
+	if result.Up || result.HasData {
+		t.Errorf("Expected failed result without data, got Up=%t HasData=%t", result.Up, result.HasData)
+	}
+	if result.LastSuccessTimestampSeconds != 0 {
+		t.Errorf("Expected no last success timestamp, got %f", result.LastSuccessTimestampSeconds)
+	}
+	if result.SourceUpdatedTimestampSeconds != 0 {
+		t.Errorf("Expected no source updated timestamp, got %f", result.SourceUpdatedTimestampSeconds)
+	}
+}
+
+func TestMarkFailedPreservesPreviousData(t *testing.T) {
+	previous := SubscriptionMetrics{
+		SID:                           "cached123",
+		Source:                        "vnstat_ssh",
+		Up:                            true,
+		HasData:                       true,
+		DownloadBytes:                 100,
+		UploadBytes:                   20,
+		QuotaBytes:                    500,
+		ExpireTimestampSeconds:        2_000,
+		UsedBytes:                     120,
+		RemainingBytes:                380,
+		UsedRatio:                     0.24,
+		RemainingRatio:                0.76,
+		SecondsUntilExpire:            1_000,
+		DaysUntilExpire:               1.5,
+		Expired:                       0,
+		DailyBudgetBytes:              253.33,
+		LastRefreshTimestampSeconds:   1_000,
+		LastSuccessTimestampSeconds:   1_000,
+		SourceUpdatedTimestampSeconds: 990,
+		RefreshDurationSeconds:        1,
+	}
+	refreshStart := time.Now().Add(-2 * time.Second)
+
+	result := MarkFailed("cached123", "vnstat_ssh", &previous, refreshStart)
+
+	if result.Up || !result.HasData {
+		t.Errorf("Expected failed result with cached data, got Up=%t HasData=%t", result.Up, result.HasData)
+	}
+	if result.DownloadBytes != previous.DownloadBytes ||
+		result.UploadBytes != previous.UploadBytes ||
+		result.UsedBytes != previous.UsedBytes ||
+		result.RemainingBytes != previous.RemainingBytes ||
+		result.DailyBudgetBytes != previous.DailyBudgetBytes {
+		t.Errorf("Expected raw and derived values to be preserved, got %+v", result)
+	}
+	if result.LastSuccessTimestampSeconds != previous.LastSuccessTimestampSeconds {
+		t.Errorf("Expected LastSuccessTimestampSeconds to remain %f, got %f", previous.LastSuccessTimestampSeconds, result.LastSuccessTimestampSeconds)
+	}
+	if result.SourceUpdatedTimestampSeconds != previous.SourceUpdatedTimestampSeconds {
+		t.Errorf("Expected SourceUpdatedTimestampSeconds to remain %f, got %f", previous.SourceUpdatedTimestampSeconds, result.SourceUpdatedTimestampSeconds)
+	}
+	if result.LastRefreshTimestampSeconds <= previous.LastRefreshTimestampSeconds {
+		t.Errorf("Expected LastRefreshTimestampSeconds to advance, got %f", result.LastRefreshTimestampSeconds)
+	}
+	if result.RefreshDurationSeconds < 2 {
+		t.Errorf("Expected RefreshDurationSeconds at least 2, got %f", result.RefreshDurationSeconds)
 	}
 }
