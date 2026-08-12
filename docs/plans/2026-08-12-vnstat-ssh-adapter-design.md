@@ -574,7 +574,7 @@ Compose 改为 JSON 配置和只读 secret 挂载：
 ```yaml
 services:
   xui-exporter:
-    image: ghcr.io/methol/xui-exporter:latest
+    image: ghcr.io/methol-dev/xui-exporter:latest
     container_name: xui-exporter
     restart: unless-stopped
     ports:
